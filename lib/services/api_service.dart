@@ -9,8 +9,7 @@ import '../models/session.dart';
 
 class ApiService {
   
-  static const String baseUrl =
-    "https://tractar-actualizado-production.up.railway.app";
+  static const String baseUrl = "http://127.0.0.1:8000";
     
   // =========================
   // LOGIN
@@ -29,10 +28,15 @@ class ApiService {
       final data = jsonDecode(response.body);
 
       if (data["success"] == true) {
-        Session.userId = data["user_id"];
-        Session.username = data["username"];
-        Session.role = data["role"];
-        Session.status = data["status"];
+        Session.userId        = data["user_id"];
+        Session.username      = data["username"];
+        Session.nombreCompleto = data["nombre_completo"] ?? "";
+        Session.cedula        = data["cedula"] ?? "";
+        Session.correo        = data["correo"] ?? "";
+        Session.telefono      = data["telefono"] ?? "";
+        // El backend devuelve "rol"; mapeamos a Session.role para compatibilidad
+        Session.role   = data["rol"] ?? data["role"] ?? "";
+        Session.status = data["status"] ?? "Disponible";
         return true;
       }
 
@@ -45,21 +49,34 @@ class ApiService {
   // =========================
   // REGISTER
   // =========================
-  static Future<String?> register(String username, String password) async {
+  static Future<String?> register({
+    required String username,
+    required String password,
+    required String nombreCompleto,
+    required String cedula,
+    required String correo,
+    required String telefono,
+    required String rol,
+  }) async {
     try {
       final response = await http.post(
         Uri.parse("$baseUrl/register"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({
-          "username": username,
-          "password": password,
+          "username":         username,
+          "password":         password,
+          "nombre_completo":  nombreCompleto,
+          "cedula":           cedula,
+          "correo":           correo,
+          "telefono":         telefono,
+          "rol":              rol,
         }),
       );
 
       final data = jsonDecode(response.body);
 
       if (data["success"] == true) {
-        return null;
+        return null; // null = sin error
       }
 
       return data["message"] ?? "No se pudo crear el usuario";
@@ -141,12 +158,12 @@ class ApiService {
   }
 
   // =========================
-  // 🔥 DETALLE VEHÍCULO (CORREGIDO)
+  // DETALLE VEHÍCULO
   // =========================
   static Future<Map<String, dynamic>?> getVehicleDetail(int vehicleId) async {
     try {
       final r = await http.get(
-        Uri.parse("$baseUrl/vehicle/$vehicleId"), // ✅ FIX
+        Uri.parse("$baseUrl/vehicle/$vehicleId"),
       );
 
       final data = jsonDecode(r.body);
@@ -162,7 +179,7 @@ class ApiService {
   }
 
   // =========================
-  // 🔥 UPDATE VEHÍCULO (NUEVO)
+  // UPDATE VEHÍCULO
   // =========================
   static Future<Map<String, dynamic>> updateVehicle({
     required int vehicleId,
@@ -315,7 +332,6 @@ class ApiService {
     return r.statusCode == 200;
   }
 
-  // Versión que retorna el mensaje completo (para mostrar errores)
   static Future<Map<String, dynamic>> addVehicleDetailed(Map<String, dynamic> v) async {
     try {
       v["user_id"] = Session.userId;
@@ -536,6 +552,7 @@ class ApiService {
       return [];
     }
   }
+
   // =========================
   // CONDUCTOR — TRACTÁS ORDENADAS
   // =========================
@@ -588,6 +605,4 @@ class ApiService {
       return null;
     }
   }
-
-
 }

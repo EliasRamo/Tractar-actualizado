@@ -1,15 +1,70 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
+from bson import ObjectId
 from io import BytesIO
 from openpyxl import Workbook
-import os
-from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-load_dotenv()
+from database import usuarios, vehiculos, afiliaciones, viajes, db
 
+# =========================
+# HELPERS
+# =========================
+
+def next_seq(collection_name: str) -> int:
+    """Genera un ID numérico autoincremental por colección."""
+    result = db["counters"].find_one_and_update(
+        {"_id": collection_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    return result["seq"]
+
+
+def serialize(doc: dict) -> dict:
+    """Devuelve el doc con 'id' como int (seq_id) y convierte ObjectId/datetime."""
+    if doc is None:
+        return doc
+    out = {}
+    for k, v in doc.items():
+        if k == "_id":
+            continue  # omitir el ObjectId interno
+        elif k == "seq_id":
+            out["id"] = v  # exponer como 'id' entero
+        elif isinstance(v, ObjectId):
+            out[k] = str(v)  # referencias internas como string (no se usan en Flutter como int)
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+def find_by_seq(collection, seq_id: int):
+    """Busca documento por su ID numérico."""
+    try:
+        return collection.find_one({"seq_id": int(seq_id)})
+    except Exception:
+        return None
+
+
+def safe_float(value, default=0.0) -> float:
+    try:
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# =========================
+# APP
+# =========================
 app = FastAPI()
 
 app.add_middleware(
@@ -20,23 +75,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Verificar que exista
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL no está configurada")
-
-# IMPORTANTE PARA RAILWAY
-if DATABASE_URL.startswith("mysql://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "mysql://",
-        "mysql+pymysql://",
-        1
-    )
-
-engine = create_engine(DATABASE_URL)
 # =========================
-# MODELOS
+# MODELOS PYDANTIC
+# (IDs como int | str para aceptar ambos desde Flutter)
 # =========================
 class LoginRequest(BaseModel):
     username: str
@@ -44,8 +86,13 @@ class LoginRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    username: str
-    password: str
+    username:        str
+    password:        str
+    nombre_completo: str
+    cedula:          str
+    correo:          str
+    telefono:        str
+    rol:             str  # "propietario" | "conductor"
 
 
 class VehicleRequest(BaseModel):
@@ -82,167 +129,113 @@ class AssignTripRequest(BaseModel):
 # =========================
 @app.post("/register")
 def register(data: RegisterRequest):
-    with engine.begin() as conn:
-        existing = conn.execute(
-            text("SELECT id FROM users WHERE username = :username"),
-            {"username": data.username}
-        ).fetchone()
+    roles_validos = {"propietario", "conductor"}
+    if data.rol not in roles_validos:
+        return {"success": False, "message": "Rol inválido. Use 'propietario' o 'conductor'"}
 
-        if existing:
-            return {"success": False, "message": "El usuario ya existe"}
+    if usuarios.find_one({"username": data.username}):
+        return {"success": False, "message": "El username ya está en uso"}
+    if usuarios.find_one({"cedula": data.cedula}):
+        return {"success": False, "message": "La cédula ya está registrada"}
+    if usuarios.find_one({"correo": data.correo}):
+        return {"success": False, "message": "El correo ya está registrado"}
 
-        conn.execute(
-            text("""
-                INSERT INTO users (username, password, role, status)
-                VALUES (:username, :password, 'propietario', 'Disponible')
-            """),
-            {
-                "username": data.username,
-                "password": data.password
-            }
-        )
-
+    seq = next_seq("usuarios")
+    usuarios.insert_one({
+        "seq_id":          seq,
+        "username":        data.username,
+        "password":        data.password,
+        "nombre_completo": data.nombre_completo,
+        "cedula":          data.cedula,
+        "correo":          data.correo,
+        "telefono":        data.telefono,
+        "rol":             data.rol,
+        "estado":          "Disponible",
+    })
     return {"success": True}
 
 
 @app.post("/login")
 def login(data: LoginRequest):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT id, username, role, status
-                FROM users
-                WHERE username = :username
-                AND password = :password
-            """),
-            data.dict()
-        ).fetchone()
-
-        if result:
-            user = dict(result._mapping)
-            return {
-                "success": True,
-                "user_id": user["id"],
-                "username": user["username"],
-                "role": user["role"],
-                "status": user["status"]
-            }
-
+    user = usuarios.find_one({"username": data.username, "password": data.password})
+    if user:
+        return {
+            "success":         True,
+            "user_id":         user["seq_id"],
+            "username":        user["username"],
+            "nombre_completo": user.get("nombre_completo", ""),
+            "cedula":          user.get("cedula", ""),
+            "correo":          user.get("correo", ""),
+            "telefono":        user.get("telefono", ""),
+            "rol":             user.get("rol", user.get("role", "")),
+            "status":          user.get("estado", user.get("status", "Disponible")),
+        }
     return {"success": False}
 
 
 # =========================
 # CONDUCTORES
 # =========================
-
-# Punto 1: endpoint para que el conductor actualice su estado laboral
 @app.put("/driver/status/{driver_id}")
 def update_driver_status(driver_id: int, status: str):
     allowed = ["Disponible", "En viaje", "Inactivo"]
     if status not in allowed:
         return {"success": False, "message": "Estado no válido"}
 
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE users SET status = :status WHERE id = :id"),
-            {"status": status, "id": driver_id}
-        )
-
+    usuarios.update_one({"seq_id": driver_id}, {"$set": {"estado": status, "status": status}})
     return {"success": True, "message": f"Estado actualizado a {status}"}
 
 
-# Punto 5: afiliaciones del conductor (propietarios y vehículos a los que está afiliado)
 @app.get("/driver/affiliations/{driver_id}")
 def get_driver_affiliations(driver_id: int):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT DISTINCT
-                    v.id AS vehicle_id,
-                    v.placa,
-                    v.marca,
-                    v.modelo,
-                    v.color,
-                    u.username AS propietario
-                FROM vehicles v
-                JOIN users u ON v.user_id = u.id
-                WHERE v.driver_id = :driver_id
-                UNION
-                SELECT DISTINCT
-                    v.id AS vehicle_id,
-                    v.placa,
-                    v.marca,
-                    v.modelo,
-                    v.color,
-                    u.username AS propietario
-                FROM vehicles v
-                JOIN users u ON v.user_id = u.id
-                JOIN vehicle_driver vd ON vd.vehicle_id = v.id
-                WHERE vd.driver_id = :driver_id
-            """),
-            {"driver_id": driver_id}
-        )
-        return {
-            "success": True,
-            "affiliations": [dict(r._mapping) for r in result]
-        }
+    aff_docs = list(afiliaciones.find({"driver_seq_id": driver_id}))
+    v_seq_ids = [a["vehicle_seq_id"] for a in aff_docs]
+
+    result = []
+    for v in vehiculos.find({"seq_id": {"$in": v_seq_ids}}):
+        owner = usuarios.find_one({"seq_id": v.get("owner_seq_id")})
+        result.append({
+            "vehicle_id":  v["seq_id"],
+            "placa":       v.get("placa", ""),
+            "marca":       v.get("marca", ""),
+            "modelo":      v.get("modelo", ""),
+            "color":       v.get("color", ""),
+            "propietario": owner["username"] if owner else "",
+        })
+
+    return {"success": True, "affiliations": result}
 
 
 @app.get("/drivers")
 def get_drivers():
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT id, username, status
-                FROM users
-                WHERE role = 'conductor'
-                ORDER BY username
-            """)
-        )
-
-        return {
-            "success": True,
-            "drivers": [dict(row._mapping) for row in result]
-        }
+    docs = list(usuarios.find({"$or": [{"rol": "conductor"}, {"role": "conductor"}]}).sort("username", 1))
+    result = [
+        {"id": d["seq_id"], "username": d.get("username", ""), "status": d.get("status", "")}
+        for d in docs
+    ]
+    return {"success": True, "drivers": result}
 
 
 # =========================
-# AFILIAR CONDUCTOR (múltiples por vehículo, múltiples por conductor)
+# AFILIAR CONDUCTOR
 # =========================
 @app.post("/assign-driver")
 def assign_driver(data: AssignDriverRequest):
-    with engine.begin() as conn:
-        # Crear tabla vehicle_driver si no existe
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS vehicle_driver (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                vehicle_id INT NOT NULL,
-                driver_id INT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_vd (vehicle_id, driver_id)
-            )
-        """))
+    existing = afiliaciones.find_one({
+        "vehicle_seq_id": data.vehicle_id,
+        "driver_seq_id":  data.driver_id,
+    })
+    if existing:
+        return {"success": False, "message": "Este conductor ya está afiliado a este vehículo"}
 
-        # Verificar si ya existe esa afiliación
-        existing = conn.execute(
-            text("SELECT id FROM vehicle_driver WHERE vehicle_id=:v AND driver_id=:d"),
-            {"v": data.vehicle_id, "d": data.driver_id}
-        ).fetchone()
+    afiliaciones.insert_one({
+        "seq_id":         next_seq("afiliaciones"),
+        "vehicle_seq_id": data.vehicle_id,
+        "driver_seq_id":  data.driver_id,
+        "created_at":     now_utc(),
+    })
 
-        if existing:
-            return {"success": False, "message": "Este conductor ya está afiliado a este vehículo"}
-
-        # Insertar en tabla junction
-        conn.execute(
-            text("INSERT INTO vehicle_driver (vehicle_id, driver_id) VALUES (:v, :d)"),
-            {"v": data.vehicle_id, "d": data.driver_id}
-        )
-
-        # También actualizar vehicles.driver_id para compatibilidad
-        conn.execute(
-            text("UPDATE vehicles SET driver_id = :driver_id WHERE id = :vehicle_id"),
-            data.dict()
-        )
+    vehiculos.update_one({"seq_id": data.vehicle_id}, {"$set": {"driver_seq_id": data.driver_id}})
 
     return {"success": True, "message": "Afiliado correctamente"}
 
@@ -252,49 +245,28 @@ def assign_driver(data: AssignDriverRequest):
 # =========================
 @app.post("/assign-trip")
 def assign_trip(data: AssignTripRequest):
-    with engine.begin() as conn:
+    active_count = viajes.count_documents({
+        "driver_seq_id": data.driver_id,
+        "trip_status":   {"$in": ["Asignado", "En ruta"]},
+    })
+    if active_count > 0:
+        return {"success": False, "message": "Este conductor ya tiene un viaje activo"}
 
-        # Punto 2: validar que el conductor no tenga viaje activo
-        active = conn.execute(
-            text("""
-                SELECT COUNT(*) AS cnt FROM trips
-                WHERE driver_id = :driver_id
-                  AND trip_status IN ('Asignado', 'En ruta')
-            """),
-            {"driver_id": data.driver_id}
-        ).fetchone()
+    vehicle = vehiculos.find_one({"seq_id": data.vehicle_id})
+    if not vehicle:
+        return {"success": False, "message": "Vehículo no encontrado"}
 
-        if active._mapping["cnt"] > 0:
-            return {
-                "success": False,
-                "message": "Este conductor ya tiene un viaje activo"
-            }
+    viajes.update_one(
+        {"seq_id": data.trip_id},
+        {"$set": {
+            "driver_seq_id":  data.driver_id,
+            "vehicle_seq_id": data.vehicle_id,
+            "vehiculo":       vehicle.get("placa", ""),
+            "trip_status":    "Asignado",
+        }}
+    )
 
-        vehicle = conn.execute(
-            text("SELECT placa FROM vehicles WHERE id = :id"),
-            {"id": data.vehicle_id}
-        ).fetchone()
-
-        conn.execute(
-            text("""
-                UPDATE trips
-                SET driver_id = :driver_id,
-                    vehiculo = :vehiculo,
-                    trip_status = 'Asignado'
-                WHERE id = :trip_id
-            """),
-            {
-                "trip_id": data.trip_id,
-                "driver_id": data.driver_id,
-                "vehiculo": vehicle._mapping["placa"]
-            }
-        )
-
-        # Punto 3: auto-actualizar status del conductor a "En viaje"
-        conn.execute(
-            text("UPDATE users SET status = 'En viaje' WHERE id = :id"),
-            {"id": data.driver_id}
-        )
+    usuarios.update_one({"seq_id": data.driver_id}, {"$set": {"estado": "En viaje", "status": "En viaje"}})
 
     return {"success": True, "message": "Viaje asignado correctamente"}
 
@@ -304,322 +276,448 @@ def assign_trip(data: AssignTripRequest):
 # =========================
 @app.get("/driver/dashboard/{driver_id}")
 def driver_dashboard(driver_id: int):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT v.*, u.username AS propietario
-                FROM vehicles v
-                JOIN users u ON v.user_id = u.id
-                WHERE v.driver_id = :driver_id
-            """),
-            {"driver_id": driver_id}
-        )
-
-        vehicles = [dict(r._mapping) for r in result]
-
-        return {
-            "success": True,
-            "vehicles": vehicles
-        }
+    docs = list(vehiculos.find({"driver_seq_id": driver_id}))
+    result = []
+    for v in docs:
+        owner = usuarios.find_one({"seq_id": v.get("owner_seq_id")})
+        row = serialize(v)
+        row["propietario"] = owner["username"] if owner else ""
+        result.append(row)
+    return {"success": True, "vehicles": result}
 
 
 # =========================
-# KPI
+# KPIs CONDUCTOR
 # =========================
 @app.get("/driver/kpis/{driver_id}")
 def driver_kpis(driver_id: int):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-                SELECT
-                    SUM(trip_status='Asignado' OR trip_status='En ruta') AS active,
-                    SUM(trip_status='Finalizado') AS completed,
-                    SUM(trip_status='Cancelado') AS cancelled,
-                    COALESCE(SUM(CASE WHEN trip_status='Finalizado' THEN CAST(flete AS DECIMAL(10,2)) ELSE 0 END), 0) AS income
-                FROM trips
-                WHERE driver_id=:driver_id
-            """),
-            {"driver_id": driver_id}
-        ).fetchone()
+    all_trips = list(viajes.find({"driver_seq_id": driver_id}))
 
-        return {"success": True, "kpis": dict(result._mapping)}
+    active    = sum(1 for t in all_trips if t.get("trip_status") in ("Asignado", "En ruta"))
+    completed = sum(1 for t in all_trips if t.get("trip_status") == "Finalizado")
+    cancelled = sum(1 for t in all_trips if t.get("trip_status") == "Cancelado")
+    income    = sum(safe_float(t.get("flete", 0)) for t in all_trips if t.get("trip_status") == "Finalizado")
+
+    return {
+        "success": True,
+        "kpis": {
+            "active":    active,
+            "completed": completed,
+            "cancelled": cancelled,
+            "income":    income,
+        }
+    }
 
 
 # =========================
-# VIAJES CON FILTRO
+# VIAJES CONDUCTOR CON FILTRO
 # =========================
 @app.get("/driver/trips/{driver_id}")
 def driver_trips(driver_id: int, status: str = "Todos"):
-    with engine.connect() as conn:
+    # Vehículos afiliados al conductor
+    aff_docs = list(afiliaciones.find({"driver_seq_id": driver_id}))
+    affiliated_v_ids = [a["vehicle_seq_id"] for a in aff_docs]
 
-        query = """
-            SELECT t.*, v.placa
-            FROM trips t
-            JOIN vehicles v ON t.vehiculo = v.placa
-            WHERE (
-                v.driver_id = :driver_id
-                OR EXISTS (
-                    SELECT 1 FROM vehicle_driver vd
-                    WHERE vd.vehicle_id = v.id AND vd.driver_id = :driver_id
-                )
-                OR t.driver_id = :driver_id
-            )
-        """
+    direct_v = list(vehiculos.find({"driver_seq_id": driver_id}))
+    direct_v_ids = [v["seq_id"] for v in direct_v]
 
-        params = {"driver_id": driver_id}
+    all_v_ids = list(set(affiliated_v_ids + direct_v_ids))
 
-        if status != "Todos":
-            query += " AND t.trip_status = :status"
-            params["status"] = status
+    query: dict = {
+        "$or": [
+            {"driver_seq_id": driver_id},
+            {"vehicle_seq_id": {"$in": all_v_ids}},
+        ]
+    }
+    if status != "Todos":
+        query["trip_status"] = status
 
-        query += " ORDER BY t.id DESC"
+    docs = list(viajes.find(query).sort("seq_id", -1))
 
-        trips = conn.execute(text(query), params)
+    result = []
+    for t in docs:
+        row = serialize(t)
+        if t.get("vehicle_seq_id"):
+            v = vehiculos.find_one({"seq_id": t["vehicle_seq_id"]})
+            row["placa"] = v.get("placa", "") if v else ""
+        result.append(row)
 
-        return {
-            "success": True,
-            "trips": [dict(t._mapping) for t in trips]
-        }
+    return {"success": True, "trips": result}
 
 
 # =========================
-# UPDATE STATUS
+# UPDATE STATUS VIAJE
 # =========================
 @app.put("/driver/trips/{trip_id}/status")
 def update_trip_status(trip_id: int, status: str):
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                UPDATE trips
-                SET trip_status = :status
-                WHERE id = :id
-            """),
-            {"status": status, "id": trip_id}
-        )
+    trip = viajes.find_one({"seq_id": trip_id})
+    viajes.update_one({"seq_id": trip_id}, {"$set": {"trip_status": status}})
 
-        # Punto 3: auto-actualizar status del conductor al finalizar/cancelar
-        if status in ("Finalizado", "Cancelado"):
-            trip = conn.execute(
-                text("SELECT driver_id FROM trips WHERE id = :id"),
-                {"id": trip_id}
-            ).fetchone()
-
-            if trip and trip._mapping["driver_id"]:
-                driver_id = trip._mapping["driver_id"]
-
-                # Solo volver a Disponible si no tiene otros viajes activos
-                other_active = conn.execute(
-                    text("""
-                        SELECT COUNT(*) AS cnt FROM trips
-                        WHERE driver_id = :driver_id
-                          AND trip_status IN ('Asignado', 'En ruta')
-                          AND id != :trip_id
-                    """),
-                    {"driver_id": driver_id, "trip_id": trip_id}
-                ).fetchone()
-
-                if other_active._mapping["cnt"] == 0:
-                    conn.execute(
-                        text("UPDATE users SET status = 'Disponible' WHERE id = :id"),
-                        {"id": driver_id}
-                    )
+    if status in ("Finalizado", "Cancelado") and trip and trip.get("driver_seq_id"):
+        driver_seq = trip["driver_seq_id"]
+        other_active = viajes.count_documents({
+            "driver_seq_id": driver_seq,
+            "trip_status":   {"$in": ["Asignado", "En ruta"]},
+            "seq_id":        {"$ne": trip_id},
+        })
+        if other_active == 0:
+            usuarios.update_one({"seq_id": driver_seq}, {"$set": {"estado": "Disponible", "status": "Disponible"}})
 
     return {"success": True}
 
 
 # =========================
-# VEHÍCULOS
+# VEHÍCULOS — SIN AFILIAR
 # =========================
-
-# ── Rutas específicas PRIMERO (antes del param genérico) ───────
-
 @app.get("/vehicles/{user_id}/sin-afiliar")
 def get_vehicles_sin_afiliar_v2(user_id: int):
-    """
-    Devuelve los vehículos DISPONIBLES para una nueva tractá:
-      - Vehículos nunca afiliados (sin driver_id), Y
-      - Vehículos afiliados cuya tractá ya FINALIZÓ o fue CANCELADA
-        (es decir, que NO tienen ningún viaje activo: 'Asignado' o 'En ruta').
-    El historial de afiliaciones y viajes anteriores NO se modifica.
-    """
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT v.id, v.placa, v.marca, v.modelo, v.color, v.apodo
-                FROM vehicles v
-                WHERE v.user_id = :user_id
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM trips t
-                      WHERE t.vehiculo = v.placa
-                        AND t.trip_status IN ('Asignado', 'En ruta')
-                  )
-            """),
-            {"user_id": user_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
+    owner_vehicles = list(vehiculos.find({"owner_seq_id": user_id}))
+    result = []
+    for v in owner_vehicles:
+        active = viajes.count_documents({
+            "vehiculo":    v.get("placa", ""),
+            "trip_status": {"$in": ["Asignado", "En ruta"]},
+        })
+        if active == 0:
+            result.append({
+                "id":     v["seq_id"],
+                "placa":  v.get("placa", ""),
+                "marca":  v.get("marca", ""),
+                "modelo": v.get("modelo", ""),
+                "color":  v.get("color", ""),
+                "apodo":  v.get("apodo"),
+            })
     return {"success": True, "vehicles": result}
 
 
+# =========================
+# VEHÍCULOS — AFILIADOS
+# =========================
 @app.get("/vehicles/{user_id}/afiliados")
 def get_vehicles_afiliados_v2(user_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT v.id, v.placa, v.marca, v.modelo, v.color, v.apodo,
-                       v.driver_id, u.username AS driver_username
-                FROM vehicles v
-                JOIN users u ON u.id = v.driver_id
-                WHERE v.user_id = :user_id
-                  AND v.driver_id IS NOT NULL
-                  AND v.driver_id != 0
-            """),
-            {"user_id": user_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
+    docs = list(vehiculos.find({
+        "owner_seq_id":  user_id,
+        "driver_seq_id": {"$exists": True, "$ne": None},
+    }))
+    result = []
+    for v in docs:
+        driver = usuarios.find_one({"seq_id": v["driver_seq_id"]}) if v.get("driver_seq_id") else None
+        result.append({
+            "id":              v["seq_id"],
+            "placa":           v.get("placa", ""),
+            "marca":           v.get("marca", ""),
+            "modelo":          v.get("modelo", ""),
+            "color":           v.get("color", ""),
+            "apodo":           v.get("apodo"),
+            "driver_id":       v.get("driver_seq_id"),
+            "driver_username": driver["username"] if driver else "",
+        })
     return {"success": True, "vehicles": result}
 
 
+# =========================
+# VEHÍCULOS — LISTADO PROPIETARIO
+# =========================
 @app.get("/vehicles/{user_id}")
 def get_vehicles(user_id: int):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM vehicles WHERE user_id=:id"),
-            {"id": user_id}
-        )
-        return [dict(r._mapping) for r in result]
+    docs = list(vehiculos.find({"owner_seq_id": user_id}))
+    return [serialize(v) for v in docs]
 
 
+# =========================
+# CREAR VEHÍCULO
+# =========================
 @app.post("/vehicles")
 def add_vehicle(v: VehicleRequest):
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO vehicles
-                    (user_id, placa, marca, modelo, color, apodo)
-                    VALUES (:user_id, :placa, :marca, :modelo, :color, :apodo)
-                """),
-                {
-                    "user_id": v.user_id,
-                    "placa": v.placa.strip().upper() if v.placa else v.placa,
-                    "marca":  v.marca,
-                    "modelo": v.modelo,
-                    "color":  v.color,
-                    "apodo":  v.apodo if v.apodo and v.apodo.strip() else None,
-                }
-            )
+        placa = v.placa.strip().upper() if v.placa else v.placa
+        if vehiculos.find_one({"placa": placa}):
+            return {"success": False, "message": "Ya existe un vehículo con esa placa"}
+
+        vehiculos.insert_one({
+            "seq_id":      next_seq("vehiculos"),
+            "owner_seq_id": v.user_id,
+            "placa":       placa,
+            "marca":       v.marca,
+            "modelo":      v.modelo,
+            "color":       v.color,
+            "apodo":       v.apodo if v.apodo and v.apodo.strip() else None,
+        })
         return {"success": True, "message": "Vehículo creado"}
     except Exception as e:
-        msg = str(e)
-        if "Duplicate entry" in msg or "duplicate" in msg.lower():
-            return {"success": False, "message": "Ya existe un vehículo con esa placa"}
-        return {"success": False, "message": msg}
+        return {"success": False, "message": str(e)}
 
 
 # =========================
-# VIAJES
+# VIAJES — SIN ASIGNAR
 # =========================
 @app.get("/trips/{user_id}/sin-asignar")
 def get_trips_sin_asignar_early(user_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT id, origen, destino, flete, trip_status
-                FROM trips
-                WHERE user_id = :user_id
-                  AND (trip_status IS NULL OR trip_status = '' OR trip_status = 'Pendiente')
-                  AND (driver_id IS NULL OR driver_id = 0)
-            """),
-            {"user_id": user_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
+    docs = list(viajes.find({
+        "owner_seq_id": user_id,
+        "trip_status":  {"$in": [None, "", "Pendiente"]},
+        "$or": [
+            {"driver_seq_id": {"$exists": False}},
+            {"driver_seq_id": None},
+        ],
+    }))
+    result = [
+        {
+            "id":          d["seq_id"],
+            "origen":      d.get("origen", ""),
+            "destino":     d.get("destino", ""),
+            "flete":       d.get("flete", ""),
+            "trip_status": d.get("trip_status") or "Pendiente",
+        }
+        for d in docs
+    ]
     return {"success": True, "trips": result}
 
 
+# =========================
+# VIAJES — LISTADO PROPIETARIO
+# =========================
 @app.get("/trips/{user_id}")
 def get_trips(user_id: int):
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM trips WHERE user_id=:id ORDER BY id DESC"),
-            {"id": user_id}
-        )
-        return [dict(r._mapping) for r in result]
+    docs = list(viajes.find({"owner_seq_id": user_id}).sort("seq_id", -1))
+    return [serialize(d) for d in docs]
 
 
+# =========================
+# CREAR VIAJE
+# =========================
 @app.post("/trips")
 def add_trip(t: TripRequest):
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO trips
-                (user_id,driver_id,origen,destino,vehiculo,flete)
-                VALUES (:user_id,:driver_id,:origen,:destino,:vehiculo,:flete)
-            """),
-            t.dict()
-        )
+    viajes.insert_one({
+        "seq_id":       next_seq("viajes"),
+        "owner_seq_id": t.user_id,
+        "driver_seq_id": t.driver_id,
+        "origen":       t.origen,
+        "destino":      t.destino,
+        "vehiculo":     t.vehiculo,
+        "flete":        t.flete,
+        "trip_status":  "Pendiente",
+        "created_at":   now_utc(),
+    })
     return {"success": True}
 
 
 # =========================
 # DETALLE VEHÍCULO
 # =========================
+def _get_vehicle_detail(vehicle_id: int):
+    v = vehiculos.find_one({"seq_id": vehicle_id})
+    if not v:
+        return {"success": False}
+
+    vehicle = serialize(v)
+
+    aff_docs = list(afiliaciones.find({"vehicle_seq_id": vehicle_id}))
+    driver_seq_ids = [a["driver_seq_id"] for a in aff_docs]
+    driver_docs = list(usuarios.find({"seq_id": {"$in": driver_seq_ids}}))
+    drivers = [
+        {"id": d["seq_id"], "username": d.get("username", ""), "status": d.get("status", "")}
+        for d in driver_docs
+    ]
+
+    return {"success": True, "vehicle": vehicle, "drivers": drivers}
+
+
 @app.get("/vehicle/{vehicle_id}")
 def get_vehicle_detail(vehicle_id: int):
-    with engine.connect() as conn:
-
-        result = conn.execute(
-            text("""
-                SELECT v.*
-                FROM vehicles v
-                WHERE v.id = :vehicle_id
-            """),
-            {"vehicle_id": vehicle_id}
-        ).fetchone()
-
-        if not result:
-            return {"success": False}
-
-        vehicle = dict(result._mapping)
-
-        # Todos los conductores afiliados (desde vehicle_driver si existe, sino vehicles.driver_id)
-        try:
-            drivers = conn.execute(
-                text("""
-                    SELECT u.id, u.username, u.status
-                    FROM vehicle_driver vd
-                    JOIN users u ON u.id = vd.driver_id
-                    WHERE vd.vehicle_id = :vehicle_id
-                """),
-                {"vehicle_id": vehicle_id}
-            ).fetchall()
-        except Exception:
-            drivers = conn.execute(
-                text("""
-                    SELECT u.id, u.username, u.status
-                    FROM users u
-                    WHERE u.id = (SELECT driver_id FROM vehicles WHERE id = :vehicle_id)
-                    AND u.id IS NOT NULL
-                """),
-                {"vehicle_id": vehicle_id}
-            ).fetchall()
-
-        return {
-            "success": True,
-            "vehicle": vehicle,
-            "drivers": [dict(d._mapping) for d in drivers],
-        }
+    return _get_vehicle_detail(vehicle_id)
 
 
-# =========================
-# 🔥 FIX CRÍTICO
-# SOPORTE PARA /vehicle/detail/{id}
-# =========================
 @app.get("/vehicle/detail/{vehicle_id}")
 def get_vehicle_detail_alias(vehicle_id: int):
-    return get_vehicle_detail(vehicle_id)
+    return _get_vehicle_detail(vehicle_id)
 
-from fastapi import Body
+
+# =========================
+# ACTUALIZAR VEHÍCULO
+# =========================
+@app.put("/vehicle/{vehicle_id}")
+def update_vehicle(vehicle_id: int, data: dict = Body(...)):
+    vehiculos.update_one(
+        {"seq_id": vehicle_id},
+        {"$set": {
+            "placa":  data.get("placa"),
+            "marca":  data.get("marca"),
+            "modelo": data.get("modelo"),
+            "color":  data.get("color"),
+            "apodo":  data.get("apodo"),
+        }}
+    )
+    return {"success": True, "message": "Vehículo actualizado"}
+
+
+# =========================
+# HISTORIAL DE TRACTÁS
+# =========================
+@app.get("/tractas/{user_id}")
+def get_tractas(user_id: int):
+    docs = list(viajes.find({
+        "owner_seq_id": user_id,
+        "trip_status":  {"$in": ["Asignado", "En ruta", "Finalizado", "Cancelado"]},
+    }).sort("seq_id", -1))
+
+    result = []
+    for t in docs:
+        row = {
+            "id":          t["seq_id"],
+            "origen":      t.get("origen", ""),
+            "destino":     t.get("destino", ""),
+            "vehiculo":    t.get("vehiculo", ""),
+            "flete":       t.get("flete", ""),
+            "trip_status": t.get("trip_status", ""),
+            "driver":      "",
+        }
+        if t.get("driver_seq_id"):
+            driver = usuarios.find_one({"seq_id": t["driver_seq_id"]})
+            row["driver"] = driver["username"] if driver else ""
+        result.append(row)
+
+    return {"success": True, "tractas": result}
+
+
+# =========================
+# AFILIACIONES PROPIETARIO
+# =========================
+@app.get("/affiliations/owner/{user_id}")
+def get_all_affiliations(user_id: int):
+    owner_vehicles = list(vehiculos.find({"owner_seq_id": user_id}))
+    v_seq_ids = [v["seq_id"] for v in owner_vehicles]
+
+    aff_docs = list(afiliaciones.find({"vehicle_seq_id": {"$in": v_seq_ids}}).sort("created_at", -1))
+
+    result = []
+    for a in aff_docs:
+        v = vehiculos.find_one({"seq_id": a["vehicle_seq_id"]})
+        d = usuarios.find_one({"seq_id": a["driver_seq_id"]})
+        if v and d:
+            result.append({
+                "vehicle_id":      v["seq_id"],
+                "placa":           v.get("placa", ""),
+                "apodo":           v.get("apodo"),
+                "marca":           v.get("marca", ""),
+                "driver_id":       d["seq_id"],
+                "driver_username": d.get("username", ""),
+            })
+
+    return {"success": True, "affiliations": result}
+
+
+@app.get("/vehicle/{vehicle_id}/affiliations")
+def get_vehicle_affiliations(vehicle_id: int):
+    aff_docs = list(afiliaciones.find({"vehicle_seq_id": vehicle_id}))
+    driver_seq_ids = [a["driver_seq_id"] for a in aff_docs]
+    driver_docs = list(usuarios.find({"seq_id": {"$in": driver_seq_ids}}))
+    result = [
+        {"id": d["seq_id"], "username": d.get("username", ""), "status": d.get("status", "")}
+        for d in driver_docs
+    ]
+    return {"success": True, "drivers": result}
+
+
+# =========================
+# PERFIL CONDUCTOR
+# =========================
+@app.get("/driver/profile/{driver_id}")
+def get_driver_profile(driver_id: int):
+    user = usuarios.find_one({"seq_id": driver_id})
+    if not user:
+        return {"success": False, "message": f"Usuario {driver_id} no encontrado"}
+
+    data = {
+        "id":              user["seq_id"],
+        "username":        user.get("username", ""),
+        "nombre_completo": user.get("nombre_completo", ""),
+        "cedula":          user.get("cedula", "") or "",
+        "correo":          user.get("correo", user.get("email", "")) or "",
+        "telefono":        user.get("telefono", "") or "",
+        "rol":             user.get("rol", user.get("role", "")),
+        "status":          user.get("estado", user.get("status", "Disponible")),
+    }
+
+    aff_docs = list(afiliaciones.find({"driver_seq_id": driver_id}))
+    v_seq_ids = [a["vehicle_seq_id"] for a in aff_docs]
+    v_docs = list(vehiculos.find({"seq_id": {"$in": v_seq_ids}}))
+    data["vehicles"] = [
+        {
+            "id":     v["seq_id"],
+            "placa":  v.get("placa", ""),
+            "apodo":  v.get("apodo"),
+            "marca":  v.get("marca", ""),
+            "modelo": v.get("modelo", ""),
+            "color":  v.get("color", ""),
+        }
+        for v in v_docs
+    ]
+
+    tracta_docs = list(viajes.find({"driver_seq_id": driver_id}).sort("seq_id", -1))
+    data["tractas"] = [
+        {
+            "id":          t["seq_id"],
+            "origen":      t.get("origen", ""),
+            "destino":     t.get("destino", ""),
+            "flete":       t.get("flete", ""),
+            "trip_status": t.get("trip_status", ""),
+            "placa":       t.get("vehiculo", ""),
+            "apodo":       None,
+        }
+        for t in tracta_docs
+    ]
+
+    data["income"] = sum(
+        safe_float(t.get("flete", 0))
+        for t in tracta_docs
+        if t.get("trip_status") == "Finalizado"
+    )
+
+    return {"success": True, "driver": data}
+
+
+# =========================
+# TRACTÁS CONDUCTOR (dashboard)
+# =========================
+@app.get("/driver/tractas/{driver_id}")
+def get_driver_tractas(driver_id: int):
+    docs = list(viajes.find({"driver_seq_id": driver_id}).sort("seq_id", 1))
+
+    result = []
+    for t in docs:
+        row = {
+            "id":            t["seq_id"],
+            "origen":        t.get("origen", ""),
+            "destino":       t.get("destino", ""),
+            "flete":         t.get("flete", ""),
+            "trip_status":   t.get("trip_status", ""),
+            "vehicle_placa": t.get("vehiculo", ""),
+            "vehicle_id":    None,
+            "placa":         t.get("vehiculo", ""),
+            "apodo":         None,
+            "marca":         None,
+            "modelo":        None,
+            "color":         None,
+            "propietario":   None,
+        }
+        if t.get("vehicle_seq_id"):
+            v = vehiculos.find_one({"seq_id": t["vehicle_seq_id"]})
+            if v:
+                owner = usuarios.find_one({"seq_id": v.get("owner_seq_id")})
+                row.update({
+                    "vehicle_id":  v["seq_id"],
+                    "placa":       v.get("placa", ""),
+                    "apodo":       v.get("apodo"),
+                    "marca":       v.get("marca", ""),
+                    "modelo":      v.get("modelo", ""),
+                    "color":       v.get("color", ""),
+                    "propietario": owner["username"] if owner else None,
+                })
+        result.append(row)
+
+    return {"success": True, "tractas": result}
+
 
 # =========================
 # REPORTES
@@ -629,86 +727,60 @@ def get_reports(
     user_id: int,
     fecha_inicio: str = None,
     fecha_fin: str = None,
-    estado: str = None
+    estado: str = None,
 ):
-    with engine.connect() as conn:
+    query: dict = {"owner_seq_id": user_id}
 
-        filters = "WHERE user_id = :user_id"
-        params = {"user_id": user_id}
-
+    if fecha_inicio or fecha_fin:
+        date_filter: dict = {}
         if fecha_inicio:
-            filters += " AND DATE(created_at) >= :fecha_inicio"
-            params["fecha_inicio"] = fecha_inicio
-
+            date_filter["$gte"] = datetime.strptime(fecha_inicio, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         if fecha_fin:
-            filters += " AND DATE(created_at) <= :fecha_fin"
-            params["fecha_fin"] = fecha_fin
+            date_filter["$lte"] = datetime.strptime(fecha_fin, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        query["created_at"] = date_filter
 
-        if estado and estado != "Todos":
-            filters += " AND trip_status = :estado"
-            params["estado"] = estado
+    if estado and estado != "Todos":
+        query["trip_status"] = estado
 
-        summary = conn.execute(
-            text(f"""
-                SELECT
-                    COUNT(*) AS total_trips,
-                    SUM(trip_status = 'Finalizado') AS completed,
-                    SUM(trip_status = 'Cancelado') AS cancelled,
-                    COALESCE(SUM(CAST(flete AS DECIMAL(10,2))), 0) AS income
-                FROM trips
-                {filters}
-            """),
-            params
-        ).fetchone()
+    docs = list(viajes.find(query).sort("seq_id", -1))
 
-        trips = conn.execute(
-            text(f"""
-                SELECT *
-                FROM trips
-                {filters}
-                ORDER BY id DESC
-            """),
-            params
-        )
+    total_trips = len(docs)
+    completed   = sum(1 for t in docs if t.get("trip_status") == "Finalizado")
+    cancelled   = sum(1 for t in docs if t.get("trip_status") == "Cancelado")
+    income      = sum(safe_float(t.get("flete", 0)) for t in docs if t.get("trip_status") == "Finalizado")
 
-        return {
-            "success": True,
-            "summary": dict(summary._mapping),
-            "trips": [dict(t._mapping) for t in trips]
-        }
+    return {
+        "success": True,
+        "summary": {
+            "total_trips": total_trips,
+            "completed":   completed,
+            "cancelled":   cancelled,
+            "income":      income,
+        },
+        "trips": [serialize(t) for t in docs],
+    }
 
 
 @app.get("/reports/{user_id}/excel")
 def download_excel(user_id: int):
-    with engine.connect() as conn:
-
-        trips = conn.execute(
-            text("""
-                SELECT origen, destino, vehiculo, flete, trip_status
-                FROM trips
-                WHERE user_id = :user_id
-                ORDER BY id DESC
-            """),
-            {"user_id": user_id}
-        )
-
-        rows = [dict(t._mapping) for t in trips]
+    docs = list(viajes.find({"owner_seq_id": user_id}).sort("seq_id", -1))
+    rows = [
+        {
+            "origen":      t.get("origen", ""),
+            "destino":     t.get("destino", ""),
+            "vehiculo":    t.get("vehiculo", ""),
+            "flete":       t.get("flete", ""),
+            "trip_status": t.get("trip_status", ""),
+        }
+        for t in docs
+    ]
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Viajes"
-
-    headers = ["Origen", "Destino", "Vehículo", "Flete", "Estado"]
-    ws.append(headers)
-
+    ws.append(["Origen", "Destino", "Vehículo", "Flete", "Estado"])
     for row in rows:
-        ws.append([
-            row.get("origen", ""),
-            row.get("destino", ""),
-            row.get("vehiculo", ""),
-            row.get("flete", ""),
-            row.get("trip_status", ""),
-        ])
+        ws.append([row["origen"], row["destino"], row["vehiculo"], row["flete"], row["trip_status"]])
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -717,7 +789,7 @@ def download_excel(user_id: int):
     return StreamingResponse(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=reporte.xlsx"}
+        headers={"Content-Disposition": "attachment; filename=reporte.xlsx"},
     )
 
 
@@ -726,329 +798,59 @@ def download_excel(user_id: int):
 # =========================
 @app.get("/billing/{user_id}")
 def get_billing(user_id: int):
-    with engine.connect() as conn:
+    finalized = list(viajes.find({"owner_seq_id": user_id, "trip_status": "Finalizado"}))
 
-        total = conn.execute(
-            text("""
-                SELECT COALESCE(SUM(CAST(flete AS DECIMAL(10,2))), 0) AS total
-                FROM trips
-                WHERE user_id = :user_id
-                  AND trip_status = 'Finalizado'
-            """),
-            {"user_id": user_id}
-        ).fetchone()
+    total   = sum(safe_float(t.get("flete", 0)) for t in finalized)
+    now     = now_utc()
+    monthly = sum(
+        safe_float(t.get("flete", 0))
+        for t in finalized
+        if t.get("created_at") and t["created_at"].year == now.year and t["created_at"].month == now.month
+    )
 
-        monthly = conn.execute(
-            text("""
-                SELECT COALESCE(SUM(CAST(flete AS DECIMAL(10,2))), 0) AS total
-                FROM trips
-                WHERE user_id = :user_id
-                  AND trip_status = 'Finalizado'
-                  AND MONTH(created_at) = MONTH(CURDATE())
-                  AND YEAR(created_at) = YEAR(CURDATE())
-            """),
-            {"user_id": user_id}
-        ).fetchone()
+    by_vehicle_map: dict = {}
+    for t in finalized:
+        placa = t.get("vehiculo") or "Sin vehículo"
+        entry = by_vehicle_map.setdefault(placa, {"vehiculo": placa, "trips": 0, "total": 0.0})
+        entry["trips"] += 1
+        entry["total"] += safe_float(t.get("flete", 0))
+    by_vehicle = sorted(by_vehicle_map.values(), key=lambda x: x["total"], reverse=True)
 
-        by_vehicle = conn.execute(
-            text("""
-                SELECT
-                    vehiculo,
-                    COUNT(*) AS trips,
-                    COALESCE(SUM(CAST(flete AS DECIMAL(10,2))), 0) AS total
-                FROM trips
-                WHERE user_id = :user_id
-                  AND trip_status = 'Finalizado'
-                GROUP BY vehiculo
-                ORDER BY total DESC
-            """),
-            {"user_id": user_id}
-        )
+    by_driver_map: dict = {}
+    for t in finalized:
+        if not t.get("driver_seq_id"):
+            continue
+        driver = usuarios.find_one({"seq_id": t["driver_seq_id"]})
+        username = driver["username"] if driver else str(t["driver_seq_id"])
+        entry = by_driver_map.setdefault(username, {"username": username, "trips": 0, "total": 0.0})
+        entry["trips"] += 1
+        entry["total"] += safe_float(t.get("flete", 0))
+    by_driver = sorted(by_driver_map.values(), key=lambda x: x["total"], reverse=True)
 
-        by_driver = conn.execute(
-            text("""
-                SELECT
-                    u.username,
-                    COUNT(*) AS trips,
-                    COALESCE(SUM(CAST(t.flete AS DECIMAL(10,2))), 0) AS total
-                FROM trips t
-                JOIN users u ON t.driver_id = u.id
-                WHERE t.user_id = :user_id
-                  AND t.trip_status = 'Finalizado'
-                GROUP BY u.username
-                ORDER BY total DESC
-            """),
-            {"user_id": user_id}
-        )
-
-        return {
-            "success": True,
-            "billing": {
-                "total": float(total._mapping["total"]),
-                "monthly": {"total": float(monthly._mapping["total"])},
-                "by_vehicle": [dict(r._mapping) for r in by_vehicle],
-                "by_driver": [dict(r._mapping) for r in by_driver],
-            }
-        }
-
-
-@app.put("/vehicle/{vehicle_id}")
-def update_vehicle(vehicle_id: int, data: dict = Body(...)):
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                UPDATE vehicles
-                SET placa = :placa,
-                    marca = :marca,
-                    modelo = :modelo,
-                    color = :color,
-                    apodo = :apodo
-                WHERE id = :id
-            """),
-            {
-                "id": vehicle_id,
-                "placa": data.get("placa"),
-                "marca": data.get("marca"),
-                "modelo": data.get("modelo"),
-                "color": data.get("color"),
-                "apodo": data.get("apodo"),
-            }
-        )
-
-    return {"success": True, "message": "Vehículo actualizado"}
-
+    return {
+        "success": True,
+        "billing": {
+            "total":      total,
+            "monthly":    {"total": monthly},
+            "by_vehicle": by_vehicle,
+            "by_driver":  by_driver,
+        },
+    }
 
 
 # =========================
-# HISTORIAL DE TRACTÁS
-# =========================
-@app.get("/tractas/{user_id}")
-def get_tractas(user_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT t.id, t.origen, t.destino, t.vehiculo, t.flete,
-                       t.trip_status, u.username AS driver
-                FROM trips t
-                LEFT JOIN users u ON u.id = t.driver_id
-                WHERE t.user_id = :user_id
-                  AND t.trip_status IN ('Asignado', 'En ruta', 'Finalizado', 'Cancelado')
-                ORDER BY t.id DESC
-            """),
-            {"user_id": user_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
-    return {"success": True, "tractas": result}
-
-
-# =========================
-# AFILIACIONES EXISTENTES (conductor→vehículos o vehículo→conductores)
-# =========================
-@app.get("/affiliations/owner/{user_id}")
-def get_all_affiliations(user_id: int):
-    """Todas las parejas conductor+vehículo afiliadas para un propietario (desde junction table)."""
-    with engine.connect() as conn:
-        # Intentar desde vehicle_driver primero
-        try:
-            rows = conn.execute(
-                text("""
-                    SELECT v.id AS vehicle_id, v.placa, v.apodo, v.marca,
-                           u.id AS driver_id, u.username AS driver_username
-                    FROM vehicle_driver vd
-                    JOIN vehicles v ON v.id = vd.vehicle_id
-                    JOIN users u ON u.id = vd.driver_id
-                    WHERE v.user_id = :user_id
-                    ORDER BY vd.created_at DESC
-                """),
-                {"user_id": user_id}
-            ).fetchall()
-        except Exception:
-            # Fallback a vehicles.driver_id
-            rows = conn.execute(
-                text("""
-                    SELECT v.id AS vehicle_id, v.placa, v.apodo, v.marca,
-                           u.id AS driver_id, u.username AS driver_username
-                    FROM vehicles v
-                    JOIN users u ON u.id = v.driver_id
-                    WHERE v.user_id = :user_id AND v.driver_id IS NOT NULL
-                """),
-                {"user_id": user_id}
-            ).fetchall()
-        result = [dict(r._mapping) for r in rows]
-    return {"success": True, "affiliations": result}
-
-
-@app.get("/vehicle/{vehicle_id}/affiliations")
-def get_vehicle_affiliations(vehicle_id: int):
-    """Todos los conductores afiliados a un vehículo (historial)."""
-    with engine.connect() as conn:
-        # Para afiliaciones múltiples necesitamos tabla vehicle_driver
-        # Por ahora devolvemos el conductor actual
-        rows = conn.execute(
-            text("""
-                SELECT u.id, u.username, u.status
-                FROM vehicles v
-                JOIN users u ON u.id = v.driver_id
-                WHERE v.id = :vehicle_id AND v.driver_id IS NOT NULL
-            """),
-            {"vehicle_id": vehicle_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
-    return {"success": True, "drivers": result}
-
-
-# =========================
-# CONDUCTOR — DATOS COMPLETOS (nuevo campo cedula, telefono, correo)
-# =========================
-@app.get("/driver/profile/{driver_id}")
-def get_driver_profile(driver_id: int):
-    # Asegurar que columnas existan (migración inline)
-    try:
-        with engine.begin() as conn:
-            for col, typedef in [
-                ("cedula",   "VARCHAR(50)"),
-                ("telefono", "VARCHAR(50)"),
-                ("email",    "VARCHAR(120)"),
-            ]:
-                try:
-                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef} DEFAULT NULL"))
-                except Exception:
-                    pass  # Ya existe
-    except Exception:
-        pass
-
-    with engine.connect() as conn:
-        # Primero intentar con cedula/telefono
-        try:
-            row = conn.execute(
-                text("""
-                    SELECT id, username, status,
-                           COALESCE(cedula, '')   AS cedula,
-                           COALESCE(telefono, '') AS telefono,
-                           COALESCE(email, '')    AS email
-                    FROM users
-                    WHERE id = :id
-                """),
-                {"id": driver_id}
-            ).fetchone()
-        except Exception:
-            row = conn.execute(
-                text("SELECT id, username, status FROM users WHERE id = :id"),
-                {"id": driver_id}
-            ).fetchone()
-
-        if not row:
-            return {"success": False, "message": f"Usuario {driver_id} no encontrado"}
-
-        data = dict(row._mapping)
-        # Garantizar campos aunque no existan
-        data.setdefault("cedula", "")
-        data.setdefault("telefono", "")
-
-        # Vehículos afiliados (vehicle_driver junction + fallback)
-        try:
-            vehicles = conn.execute(
-                text("""
-                    SELECT v.id, v.placa, v.apodo, v.marca, v.modelo, v.color
-                    FROM vehicle_driver vd
-                    JOIN vehicles v ON v.id = vd.vehicle_id
-                    WHERE vd.driver_id = :driver_id
-                """),
-                {"driver_id": driver_id}
-            ).fetchall()
-        except Exception:
-            vehicles = conn.execute(
-                text("""
-                    SELECT v.id, v.placa, v.apodo, v.marca, v.modelo, v.color
-                    FROM vehicles v
-                    WHERE v.driver_id = :driver_id
-                """),
-                {"driver_id": driver_id}
-            ).fetchall()
-
-        data["vehicles"] = [dict(v._mapping) for v in vehicles]
-
-        # Historial de tractás del conductor
-        try:
-            tractas = conn.execute(
-                text("""
-                    SELECT t.id, t.origen, t.destino, t.flete, t.trip_status,
-                           v.placa, v.apodo
-                    FROM trips t
-                    LEFT JOIN vehicles v ON v.placa = t.vehiculo
-                    WHERE t.driver_id = :driver_id
-                       OR v.driver_id = :driver_id
-                       OR EXISTS (
-                           SELECT 1 FROM vehicle_driver vd
-                           WHERE vd.vehicle_id = v.id AND vd.driver_id = :driver_id
-                       )
-                    ORDER BY t.id DESC
-                """),
-                {"driver_id": driver_id}
-            ).fetchall()
-            data["tractas"] = [dict(r._mapping) for r in tractas]
-        except Exception:
-            data["tractas"] = []
-
-        # Ingresos totales solo de tractás Finalizadas
-        try:
-            income_row = conn.execute(
-                text("""
-                    SELECT COALESCE(SUM(CAST(flete AS DECIMAL(10,2))), 0) AS income
-                    FROM trips
-                    WHERE driver_id = :driver_id
-                      AND trip_status = 'Finalizado'
-                """),
-                {"driver_id": driver_id}
-            ).fetchone()
-            data["income"] = float(income_row._mapping["income"])
-        except Exception:
-            data["income"] = 0.0
-
-    return {"success": True, "driver": data}
-
-
-# =========================
-# CONDUCTOR — TRACTÁS ORDENADAS (para dashboard conductor)
-# =========================
-@app.get("/driver/tractas/{driver_id}")
-def get_driver_tractas(driver_id: int):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT t.id, t.origen, t.destino, t.flete, t.trip_status,
-                       t.vehiculo AS vehicle_placa,
-                       v.id AS vehicle_id, v.placa, v.apodo, v.marca, v.modelo, v.color,
-                       u.username AS propietario
-                FROM trips t
-                LEFT JOIN vehicles v ON v.placa = t.vehiculo
-                LEFT JOIN users u ON u.id = v.user_id
-                WHERE t.driver_id = :driver_id
-                   OR v.driver_id = :driver_id
-                   OR EXISTS (
-                       SELECT 1 FROM vehicle_driver vd
-                       WHERE vd.vehicle_id = v.id AND vd.driver_id = :driver_id
-                   )
-                ORDER BY t.id ASC
-            """),
-            {"driver_id": driver_id}
-        ).fetchall()
-        result = [dict(r._mapping) for r in rows]
-    return {"success": True, "tractas": result}
-
-
-# =========================
-# AGREGAR cedula/telefono a users si no existen
+# STARTUP — índices MongoDB
 # =========================
 @app.on_event("startup")
-async def maybe_add_columns():
-    """Agrega columnas cedula y telefono si no existen (migración segura)."""
-    try:
-        with engine.begin() as conn:
-            for col in ["cedula", "telefono"]:
-                try:
-                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} VARCHAR(50) DEFAULT NULL"))
-                except Exception:
-                    pass  # Ya existe
-    except Exception:
-        pass
+async def create_indexes():
+    usuarios.create_index("seq_id", unique=True)
+    usuarios.create_index("username", unique=True)
+    usuarios.create_index("cedula", unique=True, sparse=True)
+    usuarios.create_index("correo", unique=True, sparse=True)
+    vehiculos.create_index("seq_id", unique=True)
+    vehiculos.create_index("placa", unique=True)
+    afiliaciones.create_index([("vehicle_seq_id", 1), ("driver_seq_id", 1)], unique=True)
+    viajes.create_index("seq_id", unique=True)
+    viajes.create_index("owner_seq_id")
+    viajes.create_index("driver_seq_id")
+    viajes.create_index("trip_status")
